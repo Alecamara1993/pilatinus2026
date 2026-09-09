@@ -932,7 +932,6 @@ td{padding:10px 14px;border-top:1px solid #f7f0ee;font-size:0.81rem;vertical-ali
 
 <script>
 /* ══ DB ══ */
-const DB_KEY='fisiopilatinus_db';
 
 /* ══ FIREBASE ══
    Preencha com as credenciais do projeto Firebase do cliente
@@ -981,10 +980,9 @@ const FS_COLLECTION='fisiocontrol';
 const FS_KEYS=['financeiro','presenca','alunos','historico','pagamentos'];
 const colRef = firestore.collection(FS_COLLECTION);
 
-/* Cache local: garante primeira pintura instantânea mesmo offline.
-   O listener (anexado só após login, mais abaixo) sobrescreve com o
-   dado da nuvem assim que chegar. */
-let db = JSON.parse(localStorage.getItem(DB_KEY)) || {
+/* db começa vazio: os dados vêm exclusivamente do Firestore, via
+   attachDbListener/attachAgendaListener (anexados após o login). */
+let db = {
   financeiro:[], presenca:[], agenda:[], alunos:[], historico:[]
 };
 FS_KEYS.forEach(k=>{ if(!db[k]) db[k]=[]; });
@@ -1003,7 +1001,6 @@ function attachDbListener(){
        Se ainda existir durante a transição, não pode sobrescrever db.agenda. */
     snap.forEach(doc=>{ if(doc.id==='agenda')return; db[doc.id]=(doc.data().items)||[]; });
     FS_KEYS.forEach(k=>{ if(!db[k]) db[k]=[]; });
-    localStorage.setItem(DB_KEY,JSON.stringify(db));
     renderAll();populateSelects();renderAgenda();
   }, err=>console.error('Erro ao ler dados do Firestore:',err));
 }
@@ -1031,11 +1028,10 @@ function excluirEventoAgenda(id){
    ao importar/restaurar um backup grande (ex.: ~11 mil eventos de
    agenda), cada um dos ~25 lotes de 450 gravações dispara o listener
    agendaColRef.onSnapshot() (porque o Firestore atualiza o cache local
-   assim que cada lote é enviado). Cada disparo desse listener refazia
-   localStorage.setItem(JSON.stringify(db)) (o db inteiro, cada vez
-   maior) e re-renderizava a Agenda e os Pacientes — ou seja, o trabalho
-   mais pesado do app rodava umas 25-50 vezes seguidas durante uma única
-   importação, e ia ficando mais lento a cada lote (o array já tinha
+   assim que cada lote é enviado). Cada disparo desse listener re-renderizava
+   a Agenda e os Pacientes (array em memória cada vez maior) — ou seja, o
+   trabalho mais pesado do app rodava umas 25-50 vezes seguidas durante uma
+   única importação, e ia ficando mais lento a cada lote (o array já tinha
    milhares de itens a mais). Isso é o que travava a tela.
    Com este contador, enquanto uma gravação em massa está em andamento
    (_executarLotesParalelo rodando), o listener só atualiza o array em
@@ -1044,7 +1040,6 @@ function excluirEventoAgenda(id){
 let _bulkAgendaDepth=0;
 function _finalizarBulkAgenda(){
   if(_bulkAgendaDepth===0){
-    localStorage.setItem(DB_KEY,JSON.stringify(db));
     renderAgenda();renderAlunos();
   }
 }
@@ -1140,7 +1135,6 @@ function attachAgendaListener(){
     // lote), não recalcula a tela a cada lote gravado — só no final
     // (ver _finalizarBulkAgenda), pra não travar a página
     if(_bulkAgendaDepth>0)return;
-    localStorage.setItem(DB_KEY,JSON.stringify(db));
     renderAgenda();renderAlunos();
   }, err=>console.error('Erro ao ler agenda do Firestore:',err));
 }
@@ -1164,12 +1158,11 @@ const renderAlunosBusca=debounce(()=>renderAlunos(),200);
 const renderCobrancaBusca=debounce(()=>renderCobranca(),200);
 function save(){saveLocal();renderAll();populateSelects();}
 function saveLocal(){
-  localStorage.setItem(DB_KEY,JSON.stringify(db));
   const batch=firestore.batch();
   FS_KEYS.forEach(k=>batch.set(colRef.doc(k), {items: db[k]||[]}));
   return batch.commit().catch(err=>{
     console.error('Erro ao salvar no Firestore:',err);
-    alert('⚠️ Não foi possível salvar na nuvem agora ('+err.message+'). Os dados ficaram salvos só neste aparelho — verifique sua internet e tente novamente, ou avise o suporte se persistir.');
+    alert('⚠️ Não foi possível salvar na nuvem agora ('+err.message+'). Verifique sua internet e tente novamente, ou avise o suporte se persistir.');
   });
 }
 
@@ -1682,7 +1675,7 @@ function inserirNaAgenda(nome,diasHoras,baseDate,semanas){
   if(!db.agenda)db.agenda=[];
   const base=baseDate||new Date();
   base.setHours(0,0,0,0);
-  const totalSemanas=semanas||52; // padrão: 1 ano
+  const totalSemanas=semanas||13; // padrão: 3 meses
   // índice rápido de existência para não duplicar
   const existe=new Set(db.agenda.filter(ev=>ev.aluno===nome&&ev.obs==='Recorrente').map(ev=>ev.data+'|'+ev.hora));
   const novos=[]; // eventos de fato criados nesta chamada (p/ gravar só o novo no Firestore)
@@ -1703,7 +1696,7 @@ function inserirNaAgenda(nome,diasHoras,baseDate,semanas){
   return novos;
 }
 
-/* ── Renovação manual: adiciona mais 1 ano de agenda a partir do último
+/* ── Renovação manual: adiciona mais 3 meses de agenda a partir do último
    slot recorrente já existente do aluno. Chamada só pelo botão "Renovar
    agenda" — não roda mais automaticamente no login nem na navegação da
    agenda, pra não gerar dados sem controle. ── */
@@ -1712,11 +1705,11 @@ function renovarAgendaAluno(id){
   if(!a||!a.diasHoras||!a.diasHoras.length)return;
   const ultimo=ultimaAgendaPorAluno(a.nome);
   const base=ultimo?new Date(ultimo+'T12:00:00'):new Date();
-  const novos=inserirNaAgenda(a.nome,a.diasHoras,base,52);
+  const novos=inserirNaAgenda(a.nome,a.diasHoras,base,13);
   saveLocal();
   salvarEventosAgendaBatch(novos);
   renderAlunos();
-  alert('Agenda de '+a.nome+' renovada por mais 1 ano (até '+fmtData(dateKey(new Date(base.getTime()+52*7*24*60*60*1000)))+').');
+  alert('Agenda de '+a.nome+' renovada por mais 3 meses (até '+fmtData(dateKey(new Date(base.getTime()+13*7*24*60*60*1000)))+').');
 }
 function ultimaAgendaPorAluno(nome){
   const slots=(db.agenda||[]).filter(ev=>ev.aluno===nome&&ev.obs==='Recorrente').map(ev=>ev.data);
@@ -1746,7 +1739,7 @@ function addAluno(){
     ativo:true
   };
   db.alunos.push(novoAluno);
-  const novosEventos=inserirNaAgenda(nome,diasHoras);
+  const novosEventos=inserirNaAgenda(nome,diasHoras,null,13);
   // limpar campos após montar objeto
   ['a-nome','a-plano','a-tel','a-nasc','a-email','a-inicio','a-venc'].forEach(id=>document.getElementById(id).value='');
   resetModChecks('a-modal-checks');
@@ -1770,10 +1763,10 @@ function toggleAtivoAluno(id){
     idsRemovidos=db.agenda.filter(ev=>ev.aluno===a.nome&&ev.obs==='Recorrente'&&ev.data>=hoje_str).map(ev=>ev.id);
     db.agenda=db.agenda.filter(ev=>!(ev.aluno===a.nome&&ev.obs==='Recorrente'&&ev.data>=hoje_str));
   } else {
-    // Reativa: reinserir na agenda a partir de hoje por 1 ano
+    // Reativa: reinserir na agenda a partir de hoje por 3 meses
     if(a.diasHoras&&a.diasHoras.length){
       const base=new Date();base.setHours(0,0,0,0);
-      novosEventos=inserirNaAgenda(a.nome,a.diasHoras,base,52);
+      novosEventos=inserirNaAgenda(a.nome,a.diasHoras,base,13);
     }
   }
   save();
@@ -1847,7 +1840,7 @@ Feliz aniversário! `);
     const diasTag=a.diasHoras&&a.diasHoras.length
       ?'<p style="font-size:0.72rem;color:#888;margin-top:4px;">'+a.diasHoras.map(d=>DIAS_LABEL_SHORT[d.dia]+' '+d.hora+(d.modalidade?' ('+d.modalidade+')':'')).join(' · ')+'</p>':'';
 
-    // ── Renovação de agenda (janela de 1 ano)
+    // ── Renovação de agenda (janela de 3 meses)
     let renovTag='', renovBtn='';
     if(a.diasHoras&&a.diasHoras.length){
       const ultimo=ultimaAgendaMap[a.nome];
@@ -1856,8 +1849,8 @@ Feliz aniversário! `);
         if(ultimo<_hojeKey)renovTag=`<p class="vencimento-vencido"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> Agenda esgotada</p>`;
         else if(diffDias<=30)renovTag=`<p class="vencimento-alerta"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg> Agenda até ${fmtData(ultimo)} — renove em breve</p>`;
       }
-      renovBtn=`<button class="btn-edit" style="width:auto;" onclick="renovarAgendaAluno(${a.id})" title="Gera mais 1 ano de agenda recorrente para este paciente">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg> Renovar agenda +1 ano
+      renovBtn=`<button class="btn-edit" style="width:auto;" onclick="renovarAgendaAluno(${a.id})" title="Gera mais 3 meses de agenda recorrente para este paciente">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg> Renovar agenda +3 meses
       </button>`;
     }
     const isAtivo=a.ativo!==false;
@@ -1953,7 +1946,7 @@ function saveEditAluno(){
   let novosEventos=[];
   if(diasHoras.length){
     const base=new Date();base.setHours(0,0,0,0);
-    novosEventos=inserirNaAgenda(nomeNovo,diasHoras,base,52);
+    novosEventos=inserirNaAgenda(nomeNovo,diasHoras,base,13);
   }
   // eventos que só tiveram o nome do aluno atualizado (não foram removidos
   // nem recriados acima) — precisam ir ao Firestore com o campo "aluno" novo
@@ -2272,9 +2265,8 @@ function salvarAgendamento(){
     eventoSalvo={id:genId(),data,hora,aluno,manual,modalidade,obs:document.getElementById('ag-obs').value.trim()};
     db.agenda.push(eventoSalvo);
   }
-  // grava só este 1 evento (não o array inteiro) — cache local continua
-  // instantâneo, e a nuvem recebe apenas o documento que de fato mudou
-  localStorage.setItem(DB_KEY,JSON.stringify(db));
+  // grava só este 1 evento (não o array inteiro) — a nuvem recebe
+  // apenas o documento que de fato mudou
   if(eventoSalvo)salvarEventoAgenda(eventoSalvo);
   closeModal('modal-agenda');
   renderAgenda();
@@ -2284,7 +2276,6 @@ function removerAgendamento(id,e){
   if(e&&e.stopPropagation)e.stopPropagation();
   if(!confirm("Remover agendamento?"))return;
   db.agenda=db.agenda.filter(x=>x.id!==id);
-  localStorage.setItem(DB_KEY,JSON.stringify(db));
   excluirEventoAgenda(id);
   renderAgenda();
 }
