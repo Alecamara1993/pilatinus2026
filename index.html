@@ -1018,51 +1018,6 @@ function attachDbListener(){
    numa coleção separada — escreve/apaga só o que realmente mudou. */
 const agendaColRef = firestore.collection(FS_COLLECTION+'_agenda');
 
-/* ══ JANELA DE SINCRONIZAÇÃO DA AGENDA ══
-   Causa raiz da lentidão/travamento: attachAgendaListener baixava e mantinha
-   "ao vivo" a SUBCOLEÇÃO INTEIRA (10 mil+ eventos e crescendo), mesmo a tela
-   só exibindo 6 dias por vez. Isso significa: (1) todo login baixava e
-   remontava um array de 10 mil+ objetos; (2) qualquer alteração em UM
-   evento — de qualquer data — disparava onSnapshot, que remontava o array
-   inteiro (snap.docs.map) e regravava tudo no localStorage a cada vez.
-   Como a maior parte desses eventos é sessão já encerrada (histórico que só
-   cresce, nunca é limpo), o app ficava mais lento a cada mês.
-   Fix: o listener agora só sincroniza uma JANELA (padrão + eventos futuros,
-   sem limite) — datas mais antigas que isso são buscadas sob demanda quando
-   alguém navega o calendário pra trás desse limite (ver renderAgenda). */
-const AGENDA_JANELA_DIAS_PASSADO = 120;
-function _agendaLimiteInferior(){
-  const d=new Date(); d.setHours(0,0,0,0);
-  d.setDate(d.getDate()-AGENDA_JANELA_DIAS_PASSADO);
-  return dateKey(d);
-}
-/* Eventos de fora da janela, buscados sob demanda (navegação pro passado).
-   Ficam separados de db.agenda de propósito: o listener da janela substitui
-   db.agenda inteiro a cada disparo, e isso apagaria esse cache se estivesse
-   misturado ali dentro. */
-let _agendaForaDaJanela=[];
-let _semanasAntigasBuscadas=new Set();
-function _agendaTodosEventos(){ return (db.agenda||[]).concat(_agendaForaDaJanela); }
-function _agendaRemoverPorIds(ids){
-  if(!ids||!ids.length)return;
-  const idsSet=new Set(ids);
-  db.agenda=(db.agenda||[]).filter(ev=>!idsSet.has(ev.id));
-  _agendaForaDaJanela=_agendaForaDaJanela.filter(ev=>!idsSet.has(ev.id));
-}
-/* Busca sob demanda os eventos de uma semana anterior à janela carregada.
-   Não entra no listener em tempo real (senão a janela cresceria pra sempre
-   ao longo de uma sessão) — é só leitura pontual, uma vez por semana visitada. */
-function _buscarSemanaForaDaJanela(inicioKey,fimKey){
-  if(_semanasAntigasBuscadas.has(inicioKey))return;
-  _semanasAntigasBuscadas.add(inicioKey);
-  agendaColRef.where('data','>=',inicioKey).where('data','<=',fimKey).get().then(snap=>{
-    if(snap.empty)return;
-    const idsJaCarregados=new Set(_agendaTodosEventos().map(e=>e.id));
-    snap.docs.forEach(d=>{ const ev=d.data(); if(!idsJaCarregados.has(ev.id))_agendaForaDaJanela.push(ev); });
-    renderAgenda();
-  }).catch(err=>console.error('Erro ao buscar semana antiga da agenda:',err));
-}
-
 function salvarEventoAgenda(ev){
   return agendaColRef.doc(String(ev.id)).set(ev).catch(err=>{
     console.error('Erro ao salvar evento da agenda:',err);
@@ -1174,13 +1129,30 @@ function migrarAgendaSeNecessario(){
   }).catch(err=>console.error('Erro ao migrar agenda para subcoleção:',err));
 }
 
-/* Sincronização em tempo real da agenda, 1 doc por evento. */
+/* Sincronização em tempo real da agenda — SOMENTE a janela recente
+   (últimos AGENDA_JANELA_DIAS dias + todo o futuro). Isso corrige o
+   travamento ao abrir o sistema: antes esse listener baixava TODOS os
+   eventos já existentes (em bases com anos de uso, muitos milhares de
+   documentos), e a tela só pintava depois desse download inteiro
+   terminar. Agora só a janela recente entra no listener em tempo real
+   (poucos docs, carga instantânea); o restante do histórico é
+   carregado 1x em segundo plano por carregarAgendaAntiga(), sem
+   travar a abertura nem manter um listener permanente sobre dados
+   antigos que raramente mudam. */
+const AGENDA_JANELA_DIAS=60;
+function _agendaDesdeKey(){
+  const d=new Date(); d.setDate(d.getDate()-AGENDA_JANELA_DIAS);
+  return dateKey(d);
+}
 let _agendaListenerAttached=false;
+let _agendaAntigaCarregada=false;
 function attachAgendaListener(){
   if(_agendaListenerAttached)return;
   _agendaListenerAttached=true;
-  agendaColRef.where('data','>=',_agendaLimiteInferior()).onSnapshot(snap=>{
-    db.agenda=snap.docs.map(d=>d.data());
+  agendaColRef.where('data','>=',_agendaDesdeKey()).onSnapshot(snap=>{
+    const recentes=snap.docs.map(d=>d.data());
+    const antigos=(db.agenda||[]).filter(ev=>ev.data<_agendaDesdeKey());
+    db.agenda=antigos.concat(recentes);
     // durante uma gravação em massa (importação/restauração/renovação em
     // lote), não recalcula a tela a cada lote gravado — só no final
     // (ver _finalizarBulkAgenda), pra não travar a página
@@ -1188,6 +1160,22 @@ function attachAgendaListener(){
     localStorage.setItem(DB_KEY,JSON.stringify(db));
     renderAgenda();renderAlunos();
   }, err=>console.error('Erro ao ler agenda do Firestore:',err));
+  carregarAgendaAntiga();
+}
+/* Carrega o histórico anterior à janela recente 1x por sessão, sem
+   tempo real (get() simples, não onSnapshot) — roda em segundo plano
+   depois que a tela já está de pé, então nunca é o motivo da tela
+   travar ao abrir. Cobre relatórios/telas que olham para o passado. */
+function carregarAgendaAntiga(){
+  if(_agendaAntigaCarregada)return;
+  _agendaAntigaCarregada=true;
+  agendaColRef.where('data','<',_agendaDesdeKey()).get().then(snap=>{
+    const antigos=snap.docs.map(d=>d.data());
+    const recentes=(db.agenda||[]).filter(ev=>ev.data>=_agendaDesdeKey());
+    db.agenda=antigos.concat(recentes);
+    localStorage.setItem(DB_KEY,JSON.stringify(db));
+    if(_bulkAgendaDepth===0){renderAgenda();renderAlunos();}
+  }).catch(err=>console.error('Erro ao carregar histórico da agenda:',err));
 }
 
 /* ══ MODALIDADE CORES ══ */
@@ -1239,25 +1227,17 @@ function guardSubmit(key,ms=800){
 
 function del(path,id){
   if(!confirm("Confirma exclusão?"))return;
-  let idsAgendaRemovidos=null, nomeAlunoRemovido=null;
+  let idsAgendaRemovidos=null;
   if(path==='alunos'){
     const a=db.alunos.find(x=>x.id===id);
     if(a){
-      nomeAlunoRemovido=a.nome;
-      idsAgendaRemovidos=_agendaTodosEventos().filter(ev=>ev.aluno===a.nome).map(ev=>ev.id);
-      _agendaRemoverPorIds(idsAgendaRemovidos);
+      idsAgendaRemovidos=db.agenda.filter(ev=>ev.aluno===a.nome).map(ev=>ev.id);
+      db.agenda=db.agenda.filter(ev=>ev.aluno!==a.nome);
     }
   }
   db[path]=db[path].filter(x=>x.id!==id);
   save();
   if(idsAgendaRemovidos)excluirEventosAgendaBatch(idsAgendaRemovidos);
-  if(nomeAlunoRemovido){
-    // Eventos desse aluno de fora da janela carregada (ver AGENDA_JANELA_DIAS_PASSADO)
-    // não estavam em memória — busca direto no Firestore pra não deixar órfãos.
-    agendaColRef.where('aluno','==',nomeAlunoRemovido).get().then(snap=>{
-      if(!snap.empty)excluirEventosAgendaBatch(snap.docs.map(d=>d.id));
-    }).catch(err=>console.error('Erro ao limpar agenda antiga do aluno removido:',err));
-  }
 }
 
 function closeModal(id){document.getElementById(id).classList.remove('open');}
@@ -1979,10 +1959,10 @@ function saveEditAluno(){
   const nomeNovo=document.getElementById('edit-aluno-nome').value.trim()||a.nome;
   // ids da agenda vinculados ao nome antigo, para depois regravar no
   // Firestore só os que sobreviverem com o nome novo (ver sync no fim)
-  const idsRenomeados=new Set(nomeNovo!==nomeAntigo?_agendaTodosEventos().filter(ev=>ev.aluno===nomeAntigo).map(ev=>ev.id):[]);
+  const idsRenomeados=new Set(nomeNovo!==nomeAntigo?db.agenda.filter(ev=>ev.aluno===nomeAntigo).map(ev=>ev.id):[]);
   // propagar novo nome em todos os registros vinculados
   if(nomeNovo!==nomeAntigo){
-    _agendaTodosEventos().forEach(ev=>{if(ev.aluno===nomeAntigo)ev.aluno=nomeNovo;});
+    db.agenda.forEach(ev=>{if(ev.aluno===nomeAntigo)ev.aluno=nomeNovo;});
     db.presenca.forEach(p=>{if(p.aluno===nomeAntigo)p.aluno=nomeNovo;});
     db.historico.forEach(h=>{if(h.aluno===nomeAntigo)h.aluno=nomeNovo;});
     db.financeiro.forEach(f=>{if(f.aluno===nomeAntigo)f.aluno=nomeNovo;});
@@ -2010,24 +1990,13 @@ function saveEditAluno(){
   }
   // eventos que só tiveram o nome do aluno atualizado (não foram removidos
   // nem recriados acima) — precisam ir ao Firestore com o campo "aluno" novo
-  const renomeados=idsRenomeados.size?_agendaTodosEventos().filter(ev=>idsRenomeados.has(ev.id)):[];
+  const renomeados=idsRenomeados.size?db.agenda.filter(ev=>idsRenomeados.has(ev.id)):[];
   closeModal('modal-aluno');
   save();
   excluirEventosAgendaBatch(idsRemovidos);
   salvarEventosAgendaBatch(novosEventos);
   salvarEventosAgendaBatch(renomeados);
   checkNotificacoes();
-  if(nomeNovo!==nomeAntigo){
-    // Eventos antigos desse aluno de fora da janela carregada (ver
-    // AGENDA_JANELA_DIAS_PASSADO) não passaram pelo laço acima —
-    // atualiza esses direto no Firestore pra não ficar histórico com nome trocado.
-    agendaColRef.where('aluno','==',nomeAntigo).get().then(snap=>{
-      if(snap.empty)return;
-      const batch=firestore.batch();
-      snap.docs.forEach(d=>batch.update(d.ref,{aluno:nomeNovo}));
-      return batch.commit();
-    }).catch(err=>console.error('Erro ao renomear agenda antiga do aluno:',err));
-  }
 }
 
 /* ══ SELECTS ══ */
@@ -2190,18 +2159,10 @@ function renderAgenda(){
 
   const hojeKey=dateKey(new Date());
 
-  // Semana fora da janela sincronizada em tempo real (navegação pro passado):
-  // busca sob demanda em vez de sincronizar tudo o tempo todo (ver AGENDA_JANELA_DIAS_PASSADO acima)
-  const semanaInicioKey=dateKey(days[0]);
-  if(semanaInicioKey<_agendaLimiteInferior()){
-    _buscarSemanaForaDaJanela(semanaInicioKey,dateKey(days[days.length-1]));
-  }
-  const todosEventos=_agendaTodosEventos();
-
   days.forEach(day=>{
     const key=dateKey(day);
     const isHoje=key===hojeKey;
-    const eventos=todosEventos.filter(ev=>ev.data===key).sort((a,b)=>a.hora.localeCompare(b.hora));
+    const eventos=(db.agenda||[]).filter(ev=>ev.data===key).sort((a,b)=>a.hora.localeCompare(b.hora));
 
     const col=document.createElement('div');
     col.style.cssText='display:flex;flex-direction:column;border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow);';
@@ -2312,7 +2273,7 @@ function openModalAgendaSlot(data,hora){
 }
 
 function editarAgendamento(id){
-  const ev=_agendaTodosEventos().find(x=>x.id===id);
+  const ev=db.agenda.find(x=>x.id===id);
   if(!ev)return;
   document.getElementById('ag-edit-id').value=id;
   document.getElementById('ag-data').value=ev.data;
@@ -2338,7 +2299,7 @@ function salvarAgendamento(){
   const editId=document.getElementById('ag-edit-id').value;
   let eventoSalvo=null;
   if(editId){
-    const ev=_agendaTodosEventos().find(x=>x.id===parseInt(editId));
+    const ev=db.agenda.find(x=>x.id===parseInt(editId));
     if(ev){ev.data=data;ev.hora=hora;ev.aluno=aluno;ev.manual=manual;ev.modalidade=modalidade;ev.obs=document.getElementById('ag-obs').value.trim();eventoSalvo=ev;}
   } else {
     eventoSalvo={id:genId(),data,hora,aluno,manual,modalidade,obs:document.getElementById('ag-obs').value.trim()};
@@ -2355,7 +2316,7 @@ function salvarAgendamento(){
 function removerAgendamento(id,e){
   if(e&&e.stopPropagation)e.stopPropagation();
   if(!confirm("Remover agendamento?"))return;
-  _agendaRemoverPorIds([id]);
+  db.agenda=db.agenda.filter(x=>x.id!==id);
   localStorage.setItem(DB_KEY,JSON.stringify(db));
   excluirEventoAgenda(id);
   renderAgenda();
@@ -2370,7 +2331,7 @@ function gerarFreqLote(){
   const data=document.getElementById('p-data').value;
   if(!data)return alert("Selecione uma data!");
   // Pegar todos os agendamentos da data (ativos)
-  const agendamentos=_agendaTodosEventos()
+  const agendamentos=(db.agenda||[])
     .filter(ev=>ev.data===data&&(ev.aluno||ev.manual))
     .filter(ev=>{
       if(!ev.aluno)return true;
